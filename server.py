@@ -11,10 +11,30 @@ Two output modes (Genie decides format; caller can override):
 
 Claude's role is to pass Genie's answer through faithfully, not to rewrite it.
 
+Auth modes (use one):
+
+  Mode A — Static KS (personal / development):
+    Set GENIE_KS to a Kaltura Session token from your MediaSpace Genie page.
+    Tokens expire (typically within 24 hours); grab a fresh one when you get 401s.
+
+  Mode B — Enterprise / programmatic (recommended for teams):
+    IT deploys KALTURA_PARTNER_ID, KALTURA_ADMIN_SECRET, and GENIE_ID in the
+    shared config. No user ID lives in the config file.
+
+    Each user runs the `genie_set_user` tool once to register their Kaltura
+    userId (typically their SSO email). The server stores it locally in
+    ~/.kaltura_genie_user and generates a per-user KS on every request,
+    caching it for ~55 minutes before auto-refreshing.
+
+    GENIE_ID is the numeric Genie knowledge-base ID configured in your KMS
+    genieai module (visible in the KMS admin console under Genie settings).
+    It is passed as the `genieid:<id>` KS privilege, which routes the session
+    to the correct knowledge base.
+
 Setup:
   1. pip install mcp httpx pyyaml
-  2. Set env var GENIE_KS to a Kaltura Session token from your MediaSpace
-  3. Add to claude_desktop_config.json (see install.sh)
+  2. Set env vars (see modes above)
+  3. Add to claude_desktop_config.json (see install.sh / README)
 
 Auth:  Authorization: KS <token>
 URL:   https://genie.nvp1.ovp.kaltura.com/assistant/converse
@@ -23,14 +43,119 @@ URL:   https://genie.nvp1.ovp.kaltura.com/assistant/converse
 import os
 import json
 import re
+import time
 import httpx
 from mcp.server.fastmcp import FastMCP
 
 # ── Config ──────────────────────────────────────────────────────────────────
 GENIE_URL = os.getenv("GENIE_URL", "https://genie.nvp1.ovp.kaltura.com/assistant/converse")
-GENIE_KS  = os.getenv("GENIE_KS", "")
+
+# Mode A — static KS
+GENIE_KS = os.getenv("GENIE_KS", "")
+
+# Mode B — enterprise / programmatic KS generation
+# KALTURA_USER_ID is intentionally NOT in the config — each user sets it locally
+# via the `genie_set_user` tool, which writes to ~/.kaltura_genie_user.
+# IT deploys PARTNER_ID / ADMIN_SECRET / GENIE_ID org-wide; users never touch them.
+KALTURA_PARTNER_ID   = os.getenv("KALTURA_PARTNER_ID", "")
+KALTURA_ADMIN_SECRET = os.getenv("KALTURA_ADMIN_SECRET", "")
+GENIE_ID             = os.getenv("GENIE_ID", "")  # numeric knowledge-base ID, e.g. "295190462"
+KALTURA_SESSION_URL  = os.getenv("KALTURA_SESSION_URL",
+                                  "https://www.kaltura.com/api_v3/service/session/action/start")
+
+# Local file where each user stores their Kaltura userId (written by genie_set_user)
+_USER_ID_FILE = os.path.expanduser("~/.kaltura_genie_user")
+
+# KS expiry is set to 1 hour; we refresh 5 minutes early.
+# Cache is keyed by user_id so switching users always gets a fresh token.
+_KS_TTL_SECS    = 3600
+_KS_BUFFER_SECS = 300
+_ks_cache: dict = {}   # user_id -> {"token": str, "expires_at": float}
 
 mcp = FastMCP("kaltura-genie")
+
+
+# ── User identity ─────────────────────────────────────────────────────────────
+def _get_user_id() -> str:
+    """
+    Resolve the Kaltura userId for the current user.
+    Priority order:
+      1. KALTURA_USER_ID env var (overrides everything — useful for testing)
+      2. ~/.kaltura_genie_user file (written by genie_set_user tool)
+    Raises ValueError with a helpful message if neither is set.
+    """
+    # Env var override (useful for dev / testing)
+    env_uid = os.getenv("KALTURA_USER_ID", "").strip()
+    if env_uid:
+        return env_uid
+
+    # Per-user local file (normal enterprise path)
+    if os.path.isfile(_USER_ID_FILE):
+        uid = open(_USER_ID_FILE).read().strip()
+        if uid:
+            return uid
+
+    raise ValueError(
+        "Kaltura user identity not set. "
+        "Ask Claude to run: genie_set_user(user_id=\"your@email.com\") — "
+        "you only need to do this once per machine."
+    )
+
+
+# ── KS resolution ─────────────────────────────────────────────────────────────
+def _generate_ks(user_id: str) -> str:
+    """
+    Generate a fresh Kaltura Session scoped to the given userId.
+    Uses type=2 (admin) with the minimal privilege set required by Genie:
+      setrole:PLAYBACK_BASE_ROLE,sview:,enableentitlement,genieid:<GENIE_ID>
+    The userId is passed so Genie's activity is attributed to the real user.
+    """
+    privs = f"setrole:PLAYBACK_BASE_ROLE,sview:,enableentitlement,genieid:{GENIE_ID}"
+    params = {
+        "secret":     KALTURA_ADMIN_SECRET,
+        "userId":     user_id,
+        "type":       "2",            # admin-impersonation session
+        "partnerId":  KALTURA_PARTNER_ID,
+        "expiry":     str(_KS_TTL_SECS),
+        "privileges": privs,
+        "format":     "1",
+    }
+    resp = httpx.post(KALTURA_SESSION_URL, data=params, timeout=15.0)
+    resp.raise_for_status()
+    return resp.text.strip().strip('"')
+
+
+def _get_ks() -> str:
+    """
+    Return a valid KS for the current user.
+    - Mode A (GENIE_KS set): return the static token as-is.
+    - Mode B (enterprise): resolve user identity, then return a cached or
+      freshly generated token scoped to that user.
+    """
+    # Mode A — static KS always takes precedence
+    if GENIE_KS:
+        return GENIE_KS
+
+    # Mode B — enterprise programmatic KS
+    if KALTURA_PARTNER_ID and KALTURA_ADMIN_SECRET and GENIE_ID:
+        user_id = _get_user_id()   # raises ValueError if not configured
+        now = time.time()
+        cached = _ks_cache.get(user_id)
+        if cached and now < cached["expires_at"]:
+            return cached["token"]
+        # Generate (or refresh) the token for this user
+        token = _generate_ks(user_id)
+        _ks_cache[user_id] = {
+            "token":      token,
+            "expires_at": now + _KS_TTL_SECS - _KS_BUFFER_SECS,
+        }
+        return token
+
+    raise ValueError(
+        "No Kaltura credentials configured. "
+        "Set GENIE_KS (Mode A) or "
+        "KALTURA_PARTNER_ID + KALTURA_ADMIN_SECRET + GENIE_ID (Mode B)."
+    )
 
 
 # ── NDJSON parser ────────────────────────────────────────────────────────────
@@ -305,9 +430,12 @@ def _call_genie(
     text_mode:       bool = False,
     markdown_output: bool = False,
 ):
-    ks = GENIE_KS
-    if not ks:
-        return {"error": "GENIE_KS is not set. Add it to the MCP server env config."}
+    try:
+        ks = _get_ks()
+    except ValueError as exc:
+        return {"error": str(exc)}
+    except Exception as exc:
+        return {"error": f"Failed to generate Kaltura Session: {exc}"}
 
     payload = {
         "sse":              False,
@@ -329,7 +457,19 @@ def _call_genie(
             resp = client.post(GENIE_URL, json=payload, headers=headers)
 
         if resp.status_code == 401:
-            return {"error": "401 Unauthorized — KS token expired. Grab a fresh one from your MediaSpace Genie page and update GENIE_KS in the config."}
+            # Invalidate cached token so the next call regenerates
+            if not GENIE_KS:
+                try:
+                    uid = _get_user_id()
+                    _ks_cache.pop(uid, None)
+                except Exception:
+                    pass
+            msg = ("401 Unauthorized — KS token expired. "
+                   "Grab a fresh token from your MediaSpace Genie page and update GENIE_KS."
+                   if GENIE_KS else
+                   "401 Unauthorized — auto-generated KS rejected. "
+                   "Check KALTURA_PARTNER_ID / KALTURA_ADMIN_SECRET / GENIE_ID.")
+            return {"error": msg}
         if resp.status_code == 403:
             return {"error": "403 Forbidden — KS does not have Genie access."}
         if resp.status_code != 200:
@@ -409,6 +549,49 @@ def genie_followup(
     return _call_genie(question=question, thread_id=thread_id,
                        text_mode=text_mode, markdown_output=markdown_output,
                        model_type=model_type)
+
+
+@mcp.tool()
+def genie_set_user(user_id: str):
+    """
+    Set the Kaltura userId for the current user on this machine.
+
+    Enterprise mode only (when KALTURA_PARTNER_ID / ADMIN_SECRET / GENIE_ID are
+    configured). This is a one-time setup step — run it once and the server
+    remembers your identity across all future sessions.
+
+    Your userId is typically your work email address (the one you use to log
+    into Kaltura / your company SSO). It is stored locally in
+    ~/.kaltura_genie_user and never leaves your machine except as the userId
+    field in Kaltura API session requests.
+
+    Args:
+        user_id: Your Kaltura userId, e.g. "jane.doe@example.com"
+    """
+    if not KALTURA_PARTNER_ID:
+        return {
+            "status": "skipped",
+            "message": "This server is running in static-KS mode (GENIE_KS is set). "
+                       "genie_set_user is only needed in enterprise mode.",
+        }
+
+    user_id = user_id.strip()
+    if not user_id:
+        return {"status": "error", "message": "user_id cannot be empty."}
+
+    # Write to the local identity file
+    with open(_USER_ID_FILE, "w") as f:
+        f.write(user_id)
+
+    # Evict any cached token for the previous user
+    _ks_cache.clear()
+
+    return {
+        "status":  "ok",
+        "message": f"User identity set to '{user_id}'. "
+                   f"Kaltura sessions will now be generated on your behalf. "
+                   f"You can verify this is working by asking Genie a question.",
+    }
 
 
 if __name__ == "__main__":
