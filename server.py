@@ -444,7 +444,7 @@ def _render_html(result: dict, ks: str) -> str:
       .clip{margin-bottom:12px}
       .player-wrap{width:100%;border-radius:8px;overflow:hidden;background:#000;
                    aspect-ratio:16/9;position:relative}
-      .player-wrap > div{width:100%!important;height:100%!important}
+      .player-wrap > div, .player-wrap > video{width:100%!important;height:100%!important;display:block}
       .ts{display:inline-flex;align-items:center;gap:4px;font-size:12px;
           color:#006EFA;margin-top:6px}
       hr{border:none;border-top:1px solid #eee;margin:20px 0}
@@ -456,8 +456,8 @@ def _render_html(result: dict, ks: str) -> str:
     </style>"""
 
     # Collect all clips with player IDs so we can init them in one script block
-    cards_html = ""
-    player_inits = []   # list of JS init strings
+    cards_html   = ""
+    player_inits = []   # list of dicts: {id, manifest, poster}
     player_idx   = 0
 
     if "flashcards" in result:
@@ -509,20 +509,11 @@ def _render_html(result: dict, ks: str) -> str:
                     f"https://www.kaltura.com/p/{pid}/thumbnail"
                     f"/entry_id/{eid}/vid_sec/{int(start)}/width/768"
                 )
-                player_inits.append(f"""
-                  (function(){{
-                    var p = KalturaPlayer.setup({{
-                      targetId: "{player_id}",
-                      provider: {{ partnerId: {pid}, uiConfId: {uiconf}, ks: "{ks}" }},
-                      playback: {{ autoplay: false }}
-                    }});
-                    p.setMedia({{
-                      sources: {{
-                        hls: [{{ id: "clip", url: "{manifest_url}", mimetype: "application/x-mpegURL" }}],
-                        poster: "{poster_url}"
-                      }}
-                    }});
-                  }})();""")
+                player_inits.append({
+                    "id":       player_id,
+                    "manifest": manifest_url,
+                    "poster":   poster_url,
+                })
 
             cards_html += f"""
             <div class="card">
@@ -552,21 +543,72 @@ def _render_html(result: dict, ks: str) -> str:
 
     init_script = ""
     if player_inits:
-        inits = "\n".join(player_inits)
+        # Build one JS block per player.  Each block checks at runtime whether
+        # KalturaPlayer (PlayKit V7) is available:
+        #   • Available  → full Kaltura V7 player with all uiconf plugins (e.g.
+        #                   "Watch full video").  Works when the HTML is opened
+        #                   directly in a browser.
+        #   • Blocked    → Claude's artifact sandbox CSP blocks www.kaltura.com
+        #                   scripts, so we fall back to hls.js + a native <video>
+        #                   element.  hls.js loads from cdnjs.cloudflare.com which
+        #                   IS allowed by Claude's sandbox.
+        # Either path plays the same pre-clipped HLS manifest URL, so seekFrom /
+        # clipTo clipping works identically in both environments.
+        player_blocks = []
+        for p in player_inits:
+            player_blocks.append(f"""
+              (function() {{
+                var manifest = "{p['manifest']}";
+                var poster   = "{p['poster']}";
+                var wrap     = document.getElementById("{p['id']}");
+                if (usePlayKit) {{
+                  var kp = KalturaPlayer.setup({{
+                    targetId: "{p['id']}",
+                    provider: {{ partnerId: {pid}, uiConfId: {uiconf}, ks: "{ks}" }},
+                    playback: {{ autoplay: false }}
+                  }});
+                  kp.setMedia({{
+                    sources: {{
+                      hls:    [{{ id: "clip", url: manifest, mimetype: "application/x-mpegURL" }}],
+                      poster: poster
+                    }}
+                  }});
+                }} else {{
+                  /* hls.js fallback — works inside Claude artifact sandbox */
+                  var video = document.createElement("video");
+                  video.controls = true;
+                  video.poster   = poster;
+                  video.style.cssText = "width:100%;height:100%";
+                  wrap.appendChild(video);
+                  if (window.Hls && Hls.isSupported()) {{
+                    var hls = new Hls();
+                    hls.loadSource(manifest);
+                    hls.attachMedia(video);
+                  }} else if (video.canPlayType("application/vnd.apple.mpegurl")) {{
+                    /* Safari — native HLS support */
+                    video.src = manifest;
+                  }}
+                }}
+              }})();""")
+
+        all_blocks = "\n".join(player_blocks)
         init_script = f"""
         <script>
-          // Wait for PlayKit library to finish loading before initialising players
           window.addEventListener('load', function() {{
+            /* PlayKit available = opened in a real browser; blocked = Claude sandbox */
+            var usePlayKit = typeof KalturaPlayer !== 'undefined';
             try {{
-              {inits}
+              {all_blocks}
             }} catch(e) {{
-              console.error('Kaltura player init error:', e);
+              console.error('Player init error:', e);
             }}
           }});
         </script>"""
 
-    # Use www.kaltura.com with partner_id in path — matches exactly what Genie uses
+    # PlayKit V7 — matches exactly what Genie uses (including "Watch full video" plugin)
     playkit_src = f"https://www.kaltura.com/p/{pid}/embedPlaykitJs/partner_id/{pid}/uiconf_id/{uiconf}"
+    # hls.js — allowed by Claude artifact sandbox CSP; used as fallback when PlayKit is blocked
+    hlsjs_src = "https://cdnjs.cloudflare.com/ajax/libs/hls.js/1.4.12/hls.min.js"
 
     return f"""<!DOCTYPE html>
 <html lang="en">
@@ -575,6 +617,7 @@ def _render_html(result: dict, ks: str) -> str:
   <meta name="viewport" content="width=device-width,initial-scale=1">
   {css}
   <script src="{playkit_src}"></script>
+  <script src="{hlsjs_src}"></script>
 </head>
 <body>
   {cards_html}
