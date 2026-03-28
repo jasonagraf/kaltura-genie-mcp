@@ -407,6 +407,183 @@ def _render_markdown(result: dict) -> str:
     return "\n".join(lines).strip()
 
 
+def _make_video_url(entry_id: str, ks: str) -> str:
+    """
+    Build a signed Kaltura playback URL for a given entry.
+    Uses the playManifest MP4 endpoint — works in any <video> tag without
+    an iframe or player widget, including sandboxed artifact environments.
+    """
+    pid = KALTURA_PARTNER_ID
+    if not pid:
+        return ""
+    return (f"https://cdnapisec.kaltura.com/p/{pid}/sp/{pid}00/playManifest"
+            f"/entryId/{entry_id}/format/url/protocol/https/a.mp4?ks={ks}")
+
+
+def _render_html(result: dict, ks: str) -> str:
+    """
+    Render Genie flashcards as a self-contained HTML document using the full
+    Kaltura V7 (PlayKit) player loaded as inline JavaScript — no iframe needed.
+    The PlayKit library is loaded once from Kaltura's CDN, then each clip gets
+    its own player instance seeked to the exact start timestamp.
+    Works in sandboxed artifact environments (Claude chat, Cowork) because it
+    uses <script> + <div>, not <iframe>.
+    """
+    pid      = KALTURA_PARTNER_ID
+    uiconf   = os.getenv("KALTURA_UICONF_ID", "55937762")  # Genie player uiconf
+
+    css = """<style>
+      *{box-sizing:border-box;margin:0;padding:0}
+      body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;
+           background:#f5f5f5;color:#1a1a1a;padding:20px;max-width:740px;margin:0 auto}
+      .card{background:#fff;border-radius:10px;padding:16px;margin-bottom:16px;
+            box-shadow:0 1px 4px rgba(0,0,0,.08)}
+      .card-num{font-size:11px;font-weight:600;text-transform:uppercase;
+                letter-spacing:.5px;color:#888;margin-bottom:4px}
+      .card-body{font-size:14px;line-height:1.6;color:#333;margin-bottom:12px}
+      .clip{margin-bottom:12px}
+      .player-wrap{width:100%;border-radius:8px;overflow:hidden;background:#000;
+                   aspect-ratio:16/9;position:relative}
+      .player-wrap > div{width:100%!important;height:100%!important}
+      .ts{display:inline-flex;align-items:center;gap:4px;font-size:12px;
+          color:#006EFA;margin-top:6px}
+      hr{border:none;border-top:1px solid #eee;margin:20px 0}
+      .sources{font-size:13px;color:#555}
+      .sources h3{font-size:12px;font-weight:600;text-transform:uppercase;
+                  letter-spacing:.5px;color:#999;margin-bottom:8px}
+      .sources li{list-style:none;margin-bottom:4px}
+      .sources code{font-size:11px;background:#f0f0f0;padding:1px 4px;border-radius:3px}
+    </style>"""
+
+    # Collect all clips with player IDs so we can init them in one script block
+    cards_html = ""
+    player_inits = []   # list of JS init strings
+    player_idx   = 0
+
+    if "flashcards" in result:
+        for i, fc in enumerate(result["flashcards"], 1):
+            title   = fc.get("title", "")
+            content = fc.get("content", "")
+            clips   = fc.get("video_clips", [])
+            heading = f"Flashcard {i}" + (f" — {title}" if title else "")
+
+            clips_html = ""
+            for clip in clips:
+                eid   = clip.get("entry_id", "")
+                start = clip.get("start_time")
+                end   = clip.get("end_time")
+                if not eid or start is None:
+                    continue
+
+                player_id  = f"kplayer_{player_idx}"
+                player_idx += 1
+                start_mmss = _secs_to_mmss(start)
+                end_mmss   = _secs_to_mmss(end) if end is not None else ""
+                ts_label   = f"{start_mmss} – {end_mmss}" if end_mmss else start_mmss
+
+                clips_html += f"""
+                <div class="clip">
+                  <div class="player-wrap">
+                    <div id="{player_id}"></div>
+                  </div>
+                  <div class="ts">
+                    <svg width="11" height="11" viewBox="0 0 24 24" fill="none"
+                      stroke="currentColor" stroke-width="2.5">
+                      <polygon points="5 3 19 12 5 21 5 3"/></svg>
+                    {ts_label}
+                  </div>
+                </div>"""
+
+                # Build a pre-clipped HLS manifest URL — same approach Genie uses.
+                # seekFrom/clipTo are in milliseconds in the manifest URL.
+                seek_ms = int(start) * 1000
+                clip_ms = int(end) * 1000 if end is not None else ""
+                clip_param = f"&clipTo={clip_ms}" if clip_ms else ""
+                manifest_url = (
+                    f"https://cdnapisec.kaltura.com/p/{pid}/sp/{pid}00/playManifest"
+                    f"/entryId/{eid}/protocol/https/format/applehttp"
+                    f"/ks/{ks}/a.m3u8"
+                    f"?seekFrom={seek_ms}{clip_param}"
+                )
+                poster_url = (
+                    f"https://www.kaltura.com/p/{pid}/thumbnail"
+                    f"/entry_id/{eid}/vid_sec/{int(start)}/width/768"
+                )
+                player_inits.append(f"""
+                  (function(){{
+                    var p = KalturaPlayer.setup({{
+                      targetId: "{player_id}",
+                      provider: {{ partnerId: {pid}, uiConfId: {uiconf}, ks: "{ks}" }},
+                      playback: {{ autoplay: false }}
+                    }});
+                    p.setMedia({{
+                      sources: {{
+                        hls: [{{ id: "clip", url: "{manifest_url}", mimetype: "application/x-mpegURL" }}],
+                        poster: "{poster_url}"
+                      }}
+                    }});
+                  }})();""")
+
+            cards_html += f"""
+            <div class="card">
+              <div class="card-num">{heading}</div>
+              <div class="card-body">{content}</div>
+              {clips_html}
+            </div>"""
+
+    elif "answer" in result:
+        cards_html = f'<div class="card"><div class="card-body">{result["answer"]}</div></div>'
+
+    sources = result.get("sources", [])
+    sources_html = ""
+    if sources:
+        items = ""
+        for s in sources:
+            t   = s.get("title", "")
+            eid = s.get("entry_id", "")
+            dur = s.get("duration")
+            dur_str = ""
+            if dur:
+                mm, ss = divmod(int(dur), 60)
+                hh, mm = divmod(mm, 60)
+                dur_str = f" ({hh}:{mm:02d}:{ss:02d})" if hh else f" ({mm}:{ss:02d})"
+            items += f'<li><strong>{t}</strong> <code>{eid}</code>{dur_str}</li>'
+        sources_html = f'<hr><div class="sources"><h3>Sources</h3><ul>{items}</ul></div>'
+
+    init_script = ""
+    if player_inits:
+        inits = "\n".join(player_inits)
+        init_script = f"""
+        <script>
+          // Wait for PlayKit library to finish loading before initialising players
+          window.addEventListener('load', function() {{
+            try {{
+              {inits}
+            }} catch(e) {{
+              console.error('Kaltura player init error:', e);
+            }}
+          }});
+        </script>"""
+
+    # Use www.kaltura.com with partner_id in path — matches exactly what Genie uses
+    playkit_src = f"https://www.kaltura.com/p/{pid}/embedPlaykitJs/partner_id/{pid}/uiconf_id/{uiconf}"
+
+    return f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  {css}
+  <script src="{playkit_src}"></script>
+</head>
+<body>
+  {cards_html}
+  {sources_html}
+  {init_script}
+</body>
+</html>"""
+
+
 def _normalise_clips(clips) -> list:
     """Normalise clip objects to {entry_id, start_time, end_time}."""
     if not clips:
@@ -429,6 +606,7 @@ def _call_genie(
     model_type:      str  = "fast",
     text_mode:       bool = False,
     markdown_output: bool = False,
+    video_output:    bool = False,
 ):
     try:
         ks = _get_ks()
@@ -476,6 +654,8 @@ def _call_genie(
             return {"error": f"Genie returned HTTP {resp.status_code}: {resp.text[:400]}"}
 
         result = parse_ndjson(resp.text)
+        if video_output:
+            return _render_html(result, ks)
         return _render_markdown(result) if markdown_output else result
 
     except httpx.TimeoutException:
@@ -491,6 +671,7 @@ def genie_query(
     question:        str,
     text_mode:       bool = False,
     markdown_output: bool = True,
+    video_output:    bool = False,
     model_type:      str  = "fast",
 ):
     """
@@ -505,13 +686,17 @@ def genie_query(
       or omit any part of it. The string already contains all headings, clip
       timestamps, and sources in the correct format. Just output it as-is.
 
+    VIDEO MODE (video_output=True):
+      Returns a self-contained HTML document with inline <video> players for
+      each clip, seeked to the exact timestamp. Render this as an HTML artifact
+      so the user sees playable video inline. Use this mode when the user wants
+      to watch the relevant clips directly in the chat.
+
     TEXT MODE (text_mode=True):
       Returns a plain markdown answer string instead of flashcards.
 
     STRUCTURED JSON (markdown_output=False):
       Returns a dict with "flashcards" list, "sources" list, and "thread_id".
-      Each flashcard has: title (str), content (str), video_clips (list of
-      {entry_id, start_time, end_time} — timestamps are pre-converted to M:SS).
 
     CRITICAL: Never reword Genie's text. Never recalculate timestamps.
     Never add emojis or decorations. Display exactly what is returned.
@@ -520,10 +705,12 @@ def genie_query(
         question:        Natural-language question
         text_mode:       False (default, flashcards) or True (plain text answer)
         markdown_output: True (default, pre-rendered markdown) or False (structured JSON)
+        video_output:    True to return inline HTML with playable <video> clips
         model_type:      "fast" (default) or "quality"
     """
     return _call_genie(question=question, text_mode=text_mode,
-                       markdown_output=markdown_output, model_type=model_type)
+                       markdown_output=markdown_output, video_output=video_output,
+                       model_type=model_type)
 
 
 @mcp.tool()
@@ -532,6 +719,7 @@ def genie_followup(
     thread_id:       str,
     text_mode:       bool = False,
     markdown_output: bool = True,
+    video_output:    bool = False,
     model_type:      str  = "fast",
 ):
     """
@@ -543,12 +731,13 @@ def genie_followup(
         question:        Follow-up question
         thread_id:       thread_id returned by a previous genie_query or genie_followup
         text_mode:       False (flashcards, default) or True (plain text)
-        markdown_output: False (default, structured JSON) or True (pre-rendered markdown)
+        markdown_output: True (default, pre-rendered markdown) or False (structured JSON)
+        video_output:    True to return inline HTML with playable <video> clips
         model_type:      "fast" (default) or "quality"
     """
     return _call_genie(question=question, thread_id=thread_id,
                        text_mode=text_mode, markdown_output=markdown_output,
-                       model_type=model_type)
+                       video_output=video_output, model_type=model_type)
 
 
 @mcp.tool()
