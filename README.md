@@ -119,10 +119,13 @@ Edit `~/Library/Application Support/Claude/claude_desktop_config.json` and add t
     "KALTURA_PARTNER_ID":   "YOUR_PARTNER_ID",
     "KALTURA_ADMIN_SECRET": "YOUR_ADMIN_SECRET",
     "GENIE_ID":             "YOUR_GENIE_ID",
-    "GENIE_URL":            "https://genie.nvp1.ovp.kaltura.com/assistant/converse"
+    "GENIE_URL":            "https://genie.nvp1.ovp.kaltura.com/assistant/converse",
+    "KALTURA_UICONF_ID":    "55937762"
   }
 }
 ```
+
+> `KALTURA_UICONF_ID` is optional — defaults to `55937762` (the Genie player uiconf). Only set this if your SE has configured a different uiconf for video output.
 
 Replace `/path/to/kaltura-genie-mcp/server.py` with the actual path on the machine.
 
@@ -147,6 +150,7 @@ Ask Genie a new question.
 | `question` | string | required | Natural-language question |
 | `text_mode` | bool | `false` | Return plain text instead of flashcards |
 | `markdown_output` | bool | `true` | Return pre-rendered markdown (recommended) |
+| `video_output` | bool | `false` | Return self-contained HTML with inline Kaltura V7 players, each clipped to the exact timestamp |
 | `model_type` | string | `"fast"` | `"fast"` or `"quality"` |
 
 ### `genie_followup`
@@ -159,6 +163,7 @@ Ask a follow-up within an existing conversation thread.
 | `thread_id` | string | required | `thread_id` from a previous `genie_query` response |
 | `text_mode` | bool | `false` | Return plain text instead of flashcards |
 | `markdown_output` | bool | `true` | Return pre-rendered markdown (recommended) |
+| `video_output` | bool | `false` | Return self-contained HTML with inline Kaltura V7 players, each clipped to the exact timestamp |
 | `model_type` | string | `"fast"` | `"fast"` or `"quality"` |
 
 ### `genie_set_user`
@@ -175,6 +180,8 @@ The userId is stored in `~/.kaltura_genie_user` and used for all subsequent KS g
 
 ## Output format
 
+### Markdown (default)
+
 By default (`markdown_output=true`), responses are pre-rendered markdown that Claude displays verbatim:
 
 ```
@@ -190,6 +197,22 @@ Manual playlists require content to be individually added...
 **Sources**
 - **Open Kaltura #48: Podcasting and Kaltura** — `1_0aip7ru9` (1:01:33)
 ```
+
+### Video (video_output=true)
+
+Returns a self-contained HTML document. When rendered as an HTML artifact in Claude, each flashcard clip appears as a playable **Kaltura V7 (PlayKit) player** inline — no iframes, no external dependencies beyond Kaltura's CDN.
+
+Each player is pre-clipped to exactly the timestamp range Genie cited, using a signed HLS manifest URL with `seekFrom` and `clipTo` parameters in milliseconds:
+
+```
+https://cdnapisec.kaltura.com/p/{pid}/sp/{pid}00/playManifest/entryId/{eid}
+  /protocol/https/format/applehttp/ks/{ks}/a.m3u8
+  ?seekFrom={start_ms}&clipTo={end_ms}
+```
+
+The player loaded is the **Genie uiconf** (`55937762` by default), which matches the player Genie uses natively — including any plugins (e.g. "Watch full video") your SE has configured in that uiconf.
+
+> **Optional env var:** Set `KALTURA_UICONF_ID` in the MCP config to override the default uiconf ID.
 
 ---
 
