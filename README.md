@@ -200,7 +200,11 @@ Manual playlists require content to be individually added...
 
 ### Video (video_output=true)
 
-Returns a self-contained HTML document. When rendered as an HTML artifact in Claude, each flashcard clip appears as a playable **Kaltura V7 (PlayKit) player** inline — no iframes, no external dependencies beyond Kaltura's CDN.
+To get inline video playback, ask Claude something like:
+
+> *"Use genie_query with video_output=true to ask about manual vs. rule-based playlists"*
+
+The MCP saves a self-contained HTML file to your `genie_mcp` folder and returns the file path. Open it in Chrome — each flashcard clip appears as a playable **Kaltura V7 (PlayKit) player** inline, no iframes, no external dependencies beyond Kaltura's CDN.
 
 Each player is pre-clipped to exactly the timestamp range Genie cited, using a signed HLS manifest URL with `seekFrom` and `clipTo` parameters in milliseconds:
 
