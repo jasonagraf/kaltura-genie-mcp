@@ -379,8 +379,11 @@ def _render_markdown(result: dict) -> str:
                 eid   = clip.get("entry_id", "")
                 start = clip.get("start_time")
                 end   = clip.get("end_time")
-                if eid and start is not None and end is not None:
-                    lines.append(f"- `{eid}`  {_secs_to_mmss(start)} – {_secs_to_mmss(end)}")
+                if eid and start is not None:
+                    ts_str = _secs_to_mmss(start)
+                    if end is not None:
+                        ts_str += f" – {_secs_to_mmss(end)}"
+                    lines.append(f"- `{eid}`  {ts_str}")
             lines.append("")
 
     # ── Text mode ────────────────────────────────────────────────────────────
