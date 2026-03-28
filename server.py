@@ -44,6 +44,7 @@ import os
 import json
 import re
 import time
+import datetime
 import httpx
 from mcp.server.fastmcp import FastMCP
 
@@ -627,6 +628,41 @@ def _render_html(result: dict, ks: str) -> str:
 </html>"""
 
 
+def _save_html(result: dict, ks: str) -> dict:
+    """
+    Render Genie flashcards as HTML and save to a timestamped file next to
+    server.py.  Returns a dict with the file path so Claude can tell the user
+    to open it in Chrome.
+
+    We write a file instead of returning raw HTML because Claude's artifact
+    sandbox blocks XHR to cdnapisec.kaltura.com (connect-src CSP), which
+    prevents hls.js from fetching the HLS manifest.  Opening the file directly
+    in Chrome has no such restriction — PlayKit loads fully, clipping works,
+    and the SE's "Watch full video" uiconf plugin appears as expected.
+    """
+    html = _render_html(result, ks)
+    ts   = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    fname = f"genie_video_{ts}.html"
+    server_dir = os.path.dirname(os.path.abspath(__file__))
+    fpath = os.path.join(server_dir, fname)
+    try:
+        with open(fpath, "w", encoding="utf-8") as f:
+            f.write(html)
+        return {
+            "status":    "ready",
+            "file_path": fpath,
+            "message": (
+                f"Genie video response saved to:\n\n  {fpath}\n\n"
+                "Open that file in Chrome to see the inline Kaltura players "
+                "with exact clip timestamps. The full Kaltura V7 player loads "
+                "there — including any plugins your SE has configured in the Genie uiconf."
+            ),
+        }
+    except OSError as exc:
+        # Fallback: return raw HTML and let Claude render it as an artifact
+        return _render_html(result, ks)
+
+
 def _normalise_clips(clips) -> list:
     """Normalise clip objects to {entry_id, start_time, end_time}."""
     if not clips:
@@ -698,7 +734,7 @@ def _call_genie(
 
         result = parse_ndjson(resp.text)
         if video_output:
-            return _render_html(result, ks)
+            return _save_html(result, ks)
         return _render_markdown(result) if markdown_output else result
 
     except httpx.TimeoutException:
@@ -730,10 +766,10 @@ def genie_query(
       timestamps, and sources in the correct format. Just output it as-is.
 
     VIDEO MODE (video_output=True):
-      Returns a self-contained HTML document with inline <video> players for
-      each clip, seeked to the exact timestamp. Render this as an HTML artifact
-      so the user sees playable video inline. Use this mode when the user wants
-      to watch the relevant clips directly in the chat.
+      Saves a self-contained HTML file to the genie_mcp folder and returns the
+      file path. Tell the user to open that file in Chrome. The file contains
+      the full Kaltura V7 (PlayKit) player with exact clip timestamps — DO NOT
+      try to render it as an artifact (Claude's sandbox blocks Kaltura CDN).
 
     TEXT MODE (text_mode=True):
       Returns a plain markdown answer string instead of flashcards.
